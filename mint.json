@@ -59,7 +59,8 @@
                 "operations/deployment",
                 "operations/authentication",
                 "operations/observability",
-                "operations/stories"
+                "operations/stories",
+                "operations/roadmap"
             ]
         }
     ]

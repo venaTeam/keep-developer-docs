@@ -1,0 +1,208 @@
+---
+title: "Engineering Roadmap"
+description: "Known limitations, planned hardening, and how to track progress."
+---
+
+This page is the public log of known limitations and planned engineering work on the Keep platform. It exists for two audiences:
+
+- **Developers** building on Keep or contributing to it — to know what is *intentional design* vs. *tracked work* before depending on a behavior or filing a bug.
+- **Managers and operators** evaluating Keep — to see the platform's actual posture (the good and the rough edges) without having to dig through code.
+
+Every item on this page is documented in detail somewhere else in this guide — the link in each row points to the page that explains the *current* behaviour. The roadmap row tells you what's *planned*.
+
+## Status legend
+
+| Symbol | Meaning |
+| --- | --- |
+| 🔴 | Affects security or correctness. Hardening is a priority. |
+| 🟡 | Affects scaling or operational robustness in non-trivial deployments. |
+| 🟢 | Developer-experience or code-organization improvement. |
+| 🟦 | Recently shipped (left in for one release as a record). |
+
+## Snapshot
+
+| Theme | Item | Severity | Status |
+| --- | --- | --- | --- |
+| Hardening | [Body-size and rate limiting on alert ingestion](#alert-ingestion-hardening) | 🔴 | Planned |
+| Hardening | [Auth on the internal SSE notify endpoint](#internal-sse-notify-auth) | 🔴 | Planned |
+| Hardening | [Drop the SSE token-in-URL fallback](#sse-token-fallback) | 🔴 | Planned |
+| Reliability | [Per-tenant Kafka partitioning key](#kafka-partition-key) | 🟡 | Planned |
+| Reliability | [Consumer-side dead-letter queue](#consumer-dlq) | 🟡 | Planned |
+| Reliability | [Distributed SSE fan-out](#sse-fanout) | 🟡 | Planned |
+| Reliability | [Distributed workflow scheduler queue](#workflow-queue-distribution) | 🟡 | Planned |
+| Reliability | [Real readiness probes](#readiness-probes) | 🟡 | Planned |
+| Reliability | [Tunable Kafka error breaker](#kafka-error-breaker) | 🟢 | Planned |
+| Code organization | [Shared `keep-providers` package](#shared-providers-package) | 🟢 | Considering |
+| Code organization | [Shared `AlertDto` schema](#shared-models) | 🟡 | Considering |
+| Code organization | [Shared CEL helpers](#shared-cel) | 🟢 | Considering |
+| Code organization | [Identity-manager re-export between gateway and event-handler](#identity-manager-drift) | 🟡 | Considering |
+| Convention | [Where event-handler schema migrations live](#event-handler-migrations) | 🟢 | Documenting only |
+| Convention | [Frontend ↔ Workflows routing](#frontend-workflows-routing) | 🟢 | Documenting only |
+
+---
+
+## Hardening
+
+### Alert ingestion hardening
+**Severity:** 🔴 &nbsp; **Status:** Planned
+
+The Gateway's `POST /alerts/event/{provider_type}` endpoint accepts payloads of any size and is not rate-limited per caller. The route is intentionally lightweight (it produces to Kafka and returns 202), but the lack of bounds means a single hostile or buggy producer can hold large bodies in memory or flood ingestion.
+
+**What we'll do:** introduce a body-size cap (`KEEP_MAX_ALERT_BODY_BYTES`) and a per-API-key rate limit through the existing `slowapi` middleware. Both should be tunable per deployment.
+
+**Where it's documented today:** [API Gateway / Webhook route](/services/api-gateway).
+
+### Internal SSE notify auth
+**Severity:** 🔴 &nbsp; **Status:** Planned
+
+The Gateway's internal `POST /sse/notify` endpoint is unauthenticated by design — it expects to be reachable only from inside the cluster. Any misconfigured ingress that exposes it publicly is a UI-spoofing vector against any tenant.
+
+**What we'll do:** require an internal shared secret in a header, or split the route onto a separate listener bound to an internal address. Until then, deployments must enforce network-level isolation (NetworkPolicy / mTLS / private listener).
+
+**Where it's documented today:** [Realtime (SSE)](/components/realtime-sse).
+
+### SSE token fallback
+**Severity:** 🔴 &nbsp; **Status:** Planned
+
+The SSE subscribe endpoint accepts an access token via query parameter as a fallback for clients that can't set headers on `EventSource`. Tokens in URLs are logged by intermediaries (load balancers, proxies, browser history).
+
+**What we'll do:** drop the query-param fallback once all clients use a `fetch`-based EventSource polyfill, or replace it with short-lived one-shot SSE tokens.
+
+**Where it's documented today:** [Realtime (SSE) / Known limitations](/components/realtime-sse).
+
+---
+
+## Reliability
+
+### Kafka partition key
+**Severity:** 🟡 &nbsp; **Status:** Planned
+
+The Gateway's Kafka producer publishes without a message key, which means records are partitioned round-robin. Per-tenant alert ordering is not guaranteed across consumer pods — a `firing → resolved` pair for the same fingerprint can be processed out of order if the partitions land on different consumers.
+
+**What we'll do:** set `key=tenant_id` (or `key=fingerprint`) on every produce. The tenant key is the safer default; fingerprint gives stronger ordering at the cost of partitioning that can hot-spot small tenants.
+
+**Where it's documented today:** [Architecture / Overview / The Kafka envelope](/architecture/overview).
+
+### Consumer DLQ
+**Severity:** 🟡 &nbsp; **Status:** Planned
+
+The Gateway's producer has a dead-letter queue for *broker-level* failures (a publish that exhausts retries goes to `keep-events-dlq`). The Event Handler does not have an equivalent: a parsing or processing exception is retried up to `MAX_PROCESSING_RETRIES` and then re-raised, which can stall a partition until human intervention.
+
+**What we'll do:** add a consumer-side DLQ topic. After exhausting retries, publish the original message + the exception traceback to `keep-events-consumer-dlq`, commit the offset, and continue. A small replay tool will let operators retry from the DLQ once the underlying bug is fixed.
+
+**Where it's documented today:** [Event Handler / Failure semantics](/services/event-handler) and [Architecture / Messaging](/architecture/messaging).
+
+### SSE fanout
+**Severity:** 🟡 &nbsp; **Status:** Planned
+
+The Gateway's SSE broker is in-memory and per-process: connection state lives in the worker that holds the open connection. Running multiple Gateway pods means a UI session that reconnects to a different pod can miss events that arrived during the disconnect window.
+
+**What we'll do:** either require sticky sessions at the load balancer (cheap, no code change) or move the broker to a Redis pub/sub fan-out so any pod can receive a notification and broadcast to its connected subscribers.
+
+**Where it's documented today:** [Realtime (SSE)](/components/realtime-sse) and [Deployment / Operational caveats](/operations/deployment).
+
+### Workflow queue distribution
+**Severity:** 🟡 &nbsp; **Status:** Planned
+
+The Workflows service's scheduler queue is in-memory: a Python list protected by a lock. A pod restart loses queued events, and multiple Workflows pods don't share work — each runs its own scheduler against the shared database.
+
+**What we'll do:** replace the in-memory list with a Redis-backed queue (`LPUSH` / `BRPOP`). Strategy semantics (`NONPARALLEL`, `NONPARALLEL_WITH_RETRY`, `PARALLEL`) already use a database unique constraint and remain correct under distribution.
+
+**Where it's documented today:** [Workflows / Scheduler internals](/services/workflows) and [Deployment / Operational caveats](/operations/deployment).
+
+### Readiness probes
+**Severity:** 🟡 &nbsp; **Status:** Planned
+
+The `/healthcheck` endpoints in every service return 200 unconditionally. They detect "process alive" but not "ready to serve traffic" — a pod with a dead database connection still passes its readiness probe.
+
+**What we'll do:** add a `/ready` endpoint per service that pings critical dependencies (database, broker) and returns 503 if any is down. Wire it into Kubernetes readiness probes; keep `/healthcheck` for liveness.
+
+**Where it's documented today:** [Observability / Health endpoints](/operations/observability).
+
+### Kafka error breaker
+**Severity:** 🟢 &nbsp; **Status:** Planned
+
+The Event Handler's Kafka consumer crashes after 10 consecutive errors. The threshold is hardcoded; a flaky network can crash-loop a pod that would otherwise self-recover.
+
+**What we'll do:** expose the threshold as `KAFKA_MAX_CONSECUTIVE_ERRORS`. Deployments on flaky networks can raise it; deployments that prefer fail-fast can lower it.
+
+**Where it's documented today:** [Architecture / Messaging](/architecture/messaging).
+
+---
+
+## Code organization
+
+These items are not *bugs* — they are conscious trade-offs from the monolith-to-microservices split. We left them duplicated to keep the split fast, and we'll consolidate as the cost of duplication accumulates.
+
+### Shared providers package
+**Severity:** 🟢 &nbsp; **Status:** Considering
+
+The `providers/` directory is duplicated across the gateway, event-handler, and workflows services. A provider bug fix is potentially three pull requests; `parse_event_raw_body` and `format_alert` semantics can drift between the gateway and event-handler copies; the frontend has its own catalog of icons and display names.
+
+**What we're considering:** extract `keep-providers` as a shared Python package (and possibly auto-generate the frontend's TypeScript catalog from it). The complexity is the dependency graph — providers reference base classes, the providers factory, secret managers, and identity managers. Either pull all of those into the package or design clean injection points.
+
+**Where it's documented today:** [Providers / Drift across services](/components/providers).
+
+### Shared models
+**Severity:** 🟡 &nbsp; **Status:** Considering
+
+`AlertDto` is defined separately in the gateway and the event-handler. The frontend has its own TypeScript type. Adding a field requires coordinated pull requests.
+
+**What we're considering:** extract `keep-models` (or fold it into the providers package). Generate the TypeScript type from the Python schema with a code generator so the frontend stays in sync automatically.
+
+**Where it's documented today:** [Architecture / Data Flow / The AlertDto](/architecture/data-flow).
+
+### Shared CEL
+**Severity:** 🟢 &nbsp; **Status:** Considering
+
+CEL helpers (`_convert_filters_to_cel`, `preprocess_cel_expression`) are duplicated between the workflow engine and the rules engine. Severity-normalization or filter-conversion bugs need fixing twice.
+
+**What we're considering:** extract a small `keep-cel` package, or fold CEL helpers into the same shared package as models and providers.
+
+**Where it's documented today:** [Rules Engine](/components/rules-engine) and [Workflow Engine](/components/workflow-engine).
+
+### Identity manager drift
+**Severity:** 🟡 &nbsp; **Status:** Considering
+
+The Event Handler ships only the `IdentityManagerTypes` enum and re-exports concrete identity managers from the Gateway's package path. This is an undeclared cross-repo dependency: refactoring the Gateway's auth tree can silently break the Event Handler.
+
+**What we're considering:** extract a `keep-identity` package. As an interim measure, a CI check that fails when the Gateway's `identity_managers/` tree changes without an Event Handler counterpart.
+
+**Where it's documented today:** [Authentication / Where the factory lives](/operations/authentication) and [Architecture / Repository Layout](/architecture/repository-layout).
+
+---
+
+## Conventions (documenting only)
+
+These items are intentional choices, not deficiencies. They appear here so contributors don't go looking for the "missing" piece.
+
+### Event handler migrations
+**Severity:** 🟢 &nbsp; **Status:** Documenting only
+
+The Event Handler has no `alembic.ini` of its own. It reads and writes tables defined and migrated by the Gateway. Schema changes the Event Handler needs go through the Gateway's migration history.
+
+**Why:** a single shared schema reduces operational complexity and lets us evolve the alert/incident model without coordinating two migration histories.
+
+**Where it's documented today:** [Architecture / Repository Layout](/architecture/repository-layout) and [Deployment / Database migrations](/operations/deployment).
+
+### Frontend ↔ Workflows routing
+**Severity:** 🟢 &nbsp; **Status:** Documenting only
+
+The frontend calls `/workflows/...` without making it explicit whether the gateway proxies to `keep-workflows` or the UI hits `keep-workflows` directly. The choice is environment configuration.
+
+**What may change:** we may make the gateway proxy `/workflows/*` explicitly so self-hosted deployments don't have to wire a second public route. For now, document the routing in your reverse proxy / ingress.
+
+**Where it's documented today:** [Frontend](/services/frontend) and [Deployment / Operational caveats](/operations/deployment).
+
+---
+
+## How this page is maintained
+
+This roadmap is updated whenever an item ships, gets de-prioritized, or a new item is identified during review. If you spot something we should add — or believe an item is mis-categorized — open an issue or PR against this repository. Each item should answer:
+
+1. **What is the current behavior?** (with a link to the doc page that describes it)
+2. **What is the planned behavior?**
+3. **Why does it matter?** (one sentence — security, scaling, drift, ergonomics)
+4. **What is the severity and status?**
+
+Items are not removed when they ship — they get marked 🟦 for one release as a visible record before being archived.

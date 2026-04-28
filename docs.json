@@ -1,0 +1,72 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Keep Developer Guide",
+  "colors": {
+    "primary": "#FA9E34",
+    "light": "#FA9E34",
+    "dark": "#FF9F36"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Getting Started",
+        "pages": [
+          "introduction",
+          "getting-started",
+          "contributing"
+        ]
+      },
+      {
+        "group": "Architecture",
+        "pages": [
+          "architecture/overview",
+          "architecture/repository-layout",
+          "architecture/data-flow",
+          "architecture/messaging",
+          "architecture/multi-tenancy"
+        ]
+      },
+      {
+        "group": "Services",
+        "pages": [
+          "services/api-gateway",
+          "services/event-handler",
+          "services/workflows",
+          "services/frontend"
+        ]
+      },
+      {
+        "group": "Core Components",
+        "pages": [
+          "components/alert-manager",
+          "components/workflow-engine",
+          "components/rules-engine",
+          "components/providers",
+          "components/realtime-sse"
+        ]
+      },
+      {
+        "group": "Operations",
+        "pages": [
+          "operations/deployment",
+          "operations/authentication",
+          "operations/observability",
+          "operations/stories",
+          "operations/roadmap"
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/logo/light.png",
+    "dark": "/logo/dark.png"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/keephq"
+    }
+  }
+}
