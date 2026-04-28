@@ -1,0 +1,101 @@
+---
+title: "Workflow Engine"
+description: "How Keep automates responses to alerts."
+---
+
+The **Workflow Engine** runs the YAML automations that turn alerts and incidents into actions. It lives in `keep-workflows`, but it talks to every other service. This page is the conceptual reference; the operational details (runtime, env vars, scheduler internals) are on the [Workflows service page](/services/workflows).
+
+## High-level architecture
+
+```mermaid
+flowchart TD
+    Event[Incoming alert / incident / schedule / manual] --> Match{Trigger match? (CEL)}
+    Match -- yes --> Sch[WorkflowScheduler]
+    Match -- no --> Ignore([Ignore])
+    Sch -->|workflows_to_run| Pool[ThreadPoolExecutor]
+    Pool --> Run[Workflow.run]
+    Run --> Steps[Step iteration<br/>{{ ... }} interpolation]
+    Steps --> Providers[ProvidersFactory<br/>HTTP, Slack, …]
+    Run --> Save[save_workflow_results]
+    Save --> Notify[SSE poll-presets / workflow-completed]
+```
+
+## Trigger matching (`insert_events`)
+
+The Workflows service receives a list of events from the Event Handler (or a manual trigger via the HTTP API). For each event:
+
+1. Fetch all enabled workflows for the tenant.
+2. Evaluate each workflow's `on:` clause as a CEL expression against the event.
+3. If `only_on_change` or `severity_changed` is set, compare against the previous alert with the same fingerprint.
+4. Append matching `(workflow, event)` pairs to `WorkflowScheduler.workflows_to_run`.
+
+CEL evaluation has two backwards-compat helpers:
+
+- `_convert_filters_to_cel` — translates the deprecated regex-filter form to CEL on the fly.
+- `preprocess_cel_expression` — rewrites severity comparisons against the numeric ordinal of `AlertSeverity` so `severity > "warning"` does the right thing.
+
+These helpers are duplicated between the workflow engine and the rules engine. Drift risk noted.
+
+## Execution context
+
+When a workflow runs, every step sees a **context** dictionary maintained by `ContextManager` (`keep-workflows/src/contextmanager/contextmanager.py`):
+
+| Variable | What it holds |
+| --- | --- |
+| `{{ event }}` / `{{ alert }}` | The triggering `AlertDto`. Both names work. |
+| `{{ incident }}` | The triggering `IncidentDto` (if the trigger is `on: incident`). |
+| `{{ steps.<id>.results }}` | The return value of a previous step (or action — they share a namespace). |
+| `{{ actions.<id>.results }}` | Alias for `steps.…`. |
+| `{{ foreach.value }}` / `{{ foreach.items }}` | The current item when iterating with `foreach:`. |
+| `{{ consts.<NAME> }}` | Workflow-level constants. |
+| `{{ vars.<key> }}` | Step-scoped variables, set by the step itself. |
+| `{{ aliases.<name> }}` | Step-scoped aliases (renamed values). |
+| `{{ secrets.<KEY> }}` | Pulled from the configured `SecretManager`. |
+| `{{ inputs.<param> }}` | Inputs to a manually-triggered workflow. |
+| `{{ providers.<type>.<key> }}` | Reference to a provider's config (e.g. base URL). |
+| `{{ last_workflow_results }}` / `{{ last_workflow_run_time }}` | Results of the previous run, useful for delta workflows. |
+
+**There is no sandbox**. `IOHandler` (`keep-workflows/src/iohandler/iohandler.py`) renders templates with a mix of [Chevron](https://github.com/noahmorrison/chevron) (Mustache) for plain `{{ var }}` substitution and Python `ast` parsing for nested `keep.*` helper calls. The full Python `eval` surface is available via the helper functions. **Do not run untrusted YAML through this engine** — the premium-provider gating exists precisely because of this.
+
+## Steps and actions
+
+`Parser` (`keep-workflows/src/parser/parser.py`) splits a workflow's body into two ordered lists:
+
+- **`steps`** — read-only / data-fetching. Failures re-raise (fast-fail).
+- **`actions`** — side-effecting (notify, ticket, mutation). Failures are caught, logged, and the loop continues. `action_stop: true` on a failed action breaks the loop.
+
+`Workflow.run` calls `run_steps()` first, then `run_actions()`. Each step:
+
+1. Evaluates `if:` (a CEL expression). Skip on false.
+2. Evaluates `foreach:` (a list expression). For each item, sets `foreach.value` / `foreach.items` and loops.
+3. Evaluates `condition:` (an array of typed conditions: `assert`, `threshold`, `equals`, `stddev`, …). All must pass.
+4. Evaluates `throttle:` (rate limit). Skip if throttled.
+5. Resolves the provider via `ProvidersFactory.get_provider_class(...)` and calls `_query` / `_notify`.
+6. Stores the result on `provider.results` (also accessible as `steps.<id>.results`).
+
+`on_failure:` at the workflow root runs after all errors and gets the accumulated error context.
+
+## Strategies
+
+The workflow's `strategy:` controls what happens when the same workflow fires twice for the same fingerprint while a run is still in flight. The mechanism is a unique-execution-number constraint at the DB layer (`SHA256(fingerprint:workflow_id) % MAX_SIGNED_INT`); collision behaviour:
+
+| Strategy | Behaviour |
+| --- | --- |
+| `NONPARALLEL` | Drop the new run, log error. |
+| `NONPARALLEL_WITH_RETRY` (default) | Re-enqueue with refreshed enrichments; retry next iteration. |
+| `PARALLEL` | Random UUID per run; no collision possible. |
+
+## Safety & limitations
+
+- **Premium providers** (`bash`, `python`, `llamacpp`, `ollama`) are blocked when `AUTH_TYPE in (AUTH0, MULTI_TENANT)`. See [Providers / Multi-tenant safety](/components/providers#multi-tenant-safety).
+- **Wall-clock timeout**: `WORKFLOWS_TIMEOUT` (default 120 minutes) marks long runs as ERROR. The thread keeps going — the timeout is informational.
+- **Single Workflows pod is the safest config today** — the queue is in-memory + per-pod and does not distribute. Multiple pods means each scheduler runs independently against the shared DB.
+
+## Code reference
+
+- **Manager**: `keep-workflows/src/workflowmanager/workflowmanager.py`.
+- **Scheduler**: `keep-workflows/src/workflowmanager/workflowscheduler.py`.
+- **Execution**: `keep-workflows/src/workflowmanager/workflow.py`, `keep-workflows/src/step/`.
+- **Parser**: `keep-workflows/src/parser/parser.py`.
+- **Templating**: `keep-workflows/src/iohandler/iohandler.py`, `keep-workflows/src/contextmanager/contextmanager.py`.
+- **DB helpers**: `keep-workflows/src/common/core/db.py` (canonical query layer; extend instead of writing ad-hoc SQL).

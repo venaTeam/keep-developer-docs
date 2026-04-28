@@ -1,0 +1,100 @@
+---
+title: "Realtime (SSE)"
+description: "How browsers see new alerts in milliseconds."
+---
+
+Keep delivers realtime updates to the browser through Server-Sent Events. The Gateway is the only service that holds open connections; the Event Handler signals the Gateway over an internal HTTP call. This page documents that substrate.
+
+## Why SSE, not WebSockets?
+
+- **Unidirectional traffic** is the only requirement (server → client).
+- **Standard HTTP** — works through any proxy, load balancer, or corporate firewall that supports long-running responses.
+- **Auto-reconnect** is built into `EventSource`.
+- **No protocol negotiation** at the LB layer.
+
+The trade-off: SSE is one-way only. Anything the client wants to send goes through normal REST.
+
+## The broker (per-process)
+
+Inside the Gateway, every active SSE connection is held in an `asyncio.Queue`. The Gateway maintains:
+
+```python
+_connections: Dict[str, List[asyncio.Queue]]
+#               ^ tenant_id → list of subscriber queues
+```
+
+`subscribe(tenant_id)` (`keep-api-gateway/src/routes/sse_routes.py`) appends a new queue, yields a `connected` event, and then `await queue.get()` in a loop with a 30-second keepalive ping.
+
+`notify(tenant_id, event, data)` does a non-blocking `put_nowait` on every queue for the tenant.
+
+```python
+# Sketch
+async def notify(tenant_id, event, data):
+    payload = format_sse(event, data)
+    for q in _connections.get(tenant_id, []):
+        q.put_nowait(payload)
+```
+
+**This map lives in process memory**. There is no shared bus. Implications below.
+
+## Event vocabulary
+
+| Event | Sent when | UI handler |
+| --- | --- | --- |
+| `connected` | Subscribe succeeded. | Mark connection healthy. |
+| `poll-alerts` | New / changed alerts processed. | Optimistically append to feed; trigger background SWR sync. |
+| `alert-update` | Single alert mutated (acknowledge, dismiss). | Patch the affected row. |
+| `incident-change` | Incident created / updated / resolved. | Re-fetch the affected incident. |
+| `incident-comment` | A comment was added to an incident. | Append to comment thread. |
+| `poll-presets` | Preset counters changed. | Re-fetch sidebar counts. |
+| `topology-update` | Service topology graph changed. | Invalidate topology view. |
+| `ai-logs-change` | AI investigation logs updated. | Stream into the logs panel. |
+
+## The internal `/sse/notify` contract
+
+The Event Handler (and other internal callers) signal the Gateway via:
+
+```http
+POST /sse/notify
+Content-Type: application/json
+
+{
+  "tenant_id": "...",
+  "event": "poll-alerts",
+  "data": { ... }
+}
+```
+
+This route is **unauthenticated by design**. It expects to be reachable only from inside the cluster — the assumption is a NetworkPolicy / mTLS boundary or a private listener.
+
+If you misconfigure ingress and expose this route publicly, an attacker can spoof events to any tenant's UI. Concretely:
+
+- Run the Gateway with two listeners (public + internal), and bind `/sse/notify` to the internal one.
+- Or front the cluster with a NetworkPolicy that limits this route to pods bearing the Event Handler / Workflows service account.
+- Or — at minimum — require an internal shared secret in a header. (Not implemented today; tracked as a hardening item.)
+
+## Subscribing from the frontend
+
+`keep-ui/.../useSSE.ts` is a singleton hook. Its responsibilities:
+
+- Open exactly one `EventSource` per session, even with concurrent re-renders.
+- Forward the access token. Prefer the `Authorization: Bearer` header from `fetch`-based subscribers; the route also accepts a `?access_token=` query parameter as a fallback for clients that can't set headers on `EventSource`. The query-param fallback is a known security smell — tokens end up in proxy logs — and should be removed when all consumers can set headers.
+- Reconnect on disconnect with exponential backoff: `1s, 2s, 4s, 8s, …` up to 10 attempts before surfacing an error to the user.
+- Dispatch typed events to per-feature subscribers (alerts feed, incidents page, presets sidebar, …).
+
+## Known limitations
+
+These are the trade-offs in the current design. Each is tracked.
+
+1. **Per-process queues**. Running multiple Gateway pods means a reconnecting client may land on a different pod and miss events that arrived during the disconnect window. Two ways out: sticky sessions at the LB, or moving the broker behind Redis pub/sub. Both are documented; neither is implemented yet.
+2. **No backpressure**. `put_nowait` on a full queue would raise; the queue size is unbounded today, so a slow client backs up memory in the Gateway.
+3. **No replay**. A client that disconnects loses everything published while it was offline. The UI compensates by always doing a `GET /alerts` background sync after `connected`, but bigger deltas (e.g. workflow-completed for a long-running run) are simply missed.
+4. **Internal endpoint has no auth**. Documented above.
+5. **Token in URL**. Documented above.
+
+## Where to look
+
+- `keep-api-gateway/src/routes/sse_routes.py` — subscribe, notify, the queue map.
+- `keep-event-handler/core/sse.py` — client wrapper that POSTs to `/sse/notify`.
+- `keep-ui/.../useSSE.ts` (look in `entities/sse/` or `shared/`) — frontend singleton.
+- `keep-ui/.../*Keys.ts` — the SWR cache keys that get re-validated when SSE events fire.

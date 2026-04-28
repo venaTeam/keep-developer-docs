@@ -1,0 +1,139 @@
+---
+title: "Authentication"
+description: "How identity, tokens, and scopes work across Keep."
+---
+
+Keep authenticates every protected endpoint through a pluggable identity layer. This page is the practical reference: which backends exist, how they validate a request, and how scope-based authorization is enforced.
+
+## Identity backends
+
+`IdentityManagerTypes` (defined in `keep-api-gateway/src/services/identity_manager/identitymanagerfactory.py`) lists the backends:
+
+| Value | Use it for |
+| --- | --- |
+| `NOAUTH` | Local dev. Every request resolves to `tenant_id="keep"`. |
+| `DB` | Self-hosted single-tenant. API keys stored hashed in `TenantApiKey`. |
+| `KEYCLOAK` | Self-hosted multi-tenant SSO. JWTs validated against Keycloak's JWKS. |
+| `AUTH0` | Multi-tenant SaaS via Auth0. |
+| `OKTA` | Multi-tenant SaaS via Okta. |
+| `ONELOGIN` | Multi-tenant SaaS via OneLogin. |
+| `OAUTH2PROXY` | Behind an OAuth2 proxy (e.g. Pomerium, oauth2-proxy). |
+
+A few legacy aliases survive for compatibility: `single_tenant` is mapped to `DB`, `multi_tenant` to `AUTH0`. Don't use them in new config.
+
+## Where the factory lives
+
+The **authoritative implementation** is in the API Gateway:
+
+```
+keep-api-gateway/src/services/identity_manager/
+├── identitymanagerfactory.py       # 151 lines — the real factory
+├── authverifierbase.py             # AuthVerifierBase.__call__
+├── authenticatedentity.py          # AuthenticatedEntity dataclass
+└── identity_managers/              # one folder per backend
+    ├── keycloak/
+    ├── auth0/
+    ├── db/
+    └── ...
+```
+
+The Event Handler ships a *thin* file at `keep-event-handler/identitymanager/identitymanagerfactory.py` (~18 lines) that re-exports the enum but defers concrete implementations to the Gateway's modules. **This is an undeclared cross-repo dependency** — refactoring auth in the Gateway can silently break the Event Handler. Tracked as a hardening item; until it's fixed, change auth in the Gateway and run the Event Handler's auth-touching tests.
+
+## How a request is authenticated
+
+`get_auth_verifier(scopes)` returns a FastAPI dependency. When a request lands on a protected route, `AuthVerifierBase.__call__` runs the dispatch:
+
+```python
+class AuthVerifierBase:
+    def __call__(self, request: Request) -> AuthenticatedEntity:
+        # 1. Bearer JWT
+        token = self._extract_bearer(request)
+        if token:
+            return self._authorize(self._verify_bearer_token(token))
+
+        # 2. API key
+        api_key = request.headers.get("X-API-KEY") or self._extract_basic(request)
+        if api_key:
+            return self._authorize(self._verify_api_key(request, api_key))
+
+        raise HTTPException(401)
+```
+
+### Bearer JWT
+
+`_verify_bearer_token` is implemented per backend. For Keycloak:
+
+- Issuer URL → JWKS endpoint, fetched once and cached locally.
+- JWT signature verified against the cached JWKS.
+- Standard claims checked: `exp`, `iss`, `aud`.
+- Custom claim `keep_tenant_id` becomes `AuthenticatedEntity.tenant_id`.
+- `keep_role` (or its equivalent) becomes `AuthenticatedEntity.role`.
+
+### API key
+
+`_verify_api_key` queries `TenantApiKey` by `key_hash` (the stored value is a hash, not the raw key). On success:
+
+- `AuthenticatedEntity.tenant_id` = `TenantApiKey.tenant_id`.
+- `AuthenticatedEntity.role` = `TenantApiKey.role`.
+- `last_used` timestamp is updated *throttled* — at most once every `KEEP_UPDATE_KEY_INTERVAL` seconds (default `60`). This avoids hot-row contention on the keys table.
+
+### HTTP Basic
+
+For tools that don't speak Bearer auth, `Authorization: Basic <base64>` is decoded and the password half is treated as an API key. Same code path as above.
+
+## `AuthenticatedEntity`
+
+```python
+@dataclass(config=ConfigDict(extra="allow"))
+class AuthenticatedEntity:
+    tenant_id: str
+    email: str
+    api_key_name: Optional[str] = None
+    role: Optional[str] = None
+```
+
+Pydantic `extra="allow"` is intentional — identity managers attach extras (Keycloak adds `org_id`, OAuth2Proxy adds the upstream group list). Handlers that need those extras can read them by attribute.
+
+## Scopes
+
+Every protected endpoint declares the scopes it requires:
+
+```python
+authenticated_entity: AuthenticatedEntity = Depends(
+    IdentityManagerFactory.get_auth_verifier(["write:alert"])
+)
+```
+
+The verifier computes whether the entity's role grants every requested scope (`role.has_scopes(self.scopes)`). The canonical scope vocabulary:
+
+| Scope | Granted to | Used by |
+| --- | --- | --- |
+| `read:alerts` | most roles | `GET /alerts`, `/alerts/query` |
+| `write:alert` | webhook role + admin | `POST /alerts/event/{provider_type}` |
+| `read:incidents`, `write:incidents` | various | `/incidents` routes |
+| `read:workflows`, `write:workflows` | various | Workflows service |
+| `read:providers`, `write:providers` | admin | Provider install/configure |
+| `read:secrets`, `write:secrets` | admin | Secrets management |
+| `read:rules`, `write:rules` | admin | Correlation/dedup rules |
+| `read:maintenance`, `write:maintenance` | admin | Maintenance windows |
+
+## Sign-in / sign-out routes
+
+Each `IdentityManager` implements `on_start(app)`, called from `keep-api-gateway/src/main.py::get_app` after routers are registered. It can wire backend-specific routes — sign-in, sign-out, OIDC callback. For example, the `DB` manager mounts a `POST /signin` that exchanges username/password for an API key; Keycloak doesn't, because the OIDC dance happens entirely on the frontend.
+
+Admin routes (users, groups, roles, permissions) live under `keep-api-gateway/src/routes/auth/`.
+
+## Frontend integration
+
+The frontend uses [next-auth](https://next-auth.js.org/) configured in `keep-ui/auth.ts`. The session callback puts the identity provider's access token onto `session.user.accessToken`. From there:
+
+- **Server-side** fetches go through `keep-ui/proxyFetch.ts` (or the Node variant `proxyFetch.node.ts`), which forwards `Authorization: Bearer <accessToken>` to the Gateway.
+- **Client-side** fetches do the same via the SWR hooks in `entities/<entity>/model/use*.ts`.
+
+Edge middleware (`keep-ui/middleware.ts`) blocks unauthenticated access to protected routes before they even render.
+
+## Pitfalls
+
+- **Tokens in URLs**: the SSE subscribe route accepts a token as a query parameter as a fallback for clients that can't set headers on `EventSource`. Tokens in URLs get logged by intermediaries — treat this as a known smell, not as an acceptable pattern. Use the `Authorization` header from your fetch when at all possible.
+- **API key rotation**: keys are stored hashed; the cleartext is shown to the user only at creation time. There's no way to recover a key from the database — rotate by issuing a new one and revoking the old.
+- **`AUTH_TYPE` mismatch between services**: the Gateway and the Workflows service must agree on `AUTH_TYPE`. The Event Handler does not authenticate at all (it consumes a Kafka topic) but it imports identity manager modules from the Gateway path, so all three need the same Python environment + config.

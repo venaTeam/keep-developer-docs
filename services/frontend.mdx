@@ -1,0 +1,102 @@
+---
+title: "Frontend"
+description: "keep/keep-ui — the Next.js dashboard."
+---
+
+The **Frontend** (`keep/keep-ui/`) is a Next.js 15 / React 19 / TypeScript application that renders the Keep dashboard. It still lives inside the `keep` monorepo while the backend is split into microservices.
+
+## Responsibilities
+
+- Render alerts, incidents, workflows, providers, and admin pages.
+- Stream updates from the Gateway via Server-Sent Events.
+- Issue authenticated requests to the Gateway (and occasionally to Workflows).
+- Handle OIDC sign-in via `next-auth` and Keycloak.
+
+## Layout (Feature-Sliced Design)
+
+The `.cursor/rules/keep-ui-react-typescript.mdc` file enforces FSD layering. Every contributor is expected to follow it.
+
+```
+keep-ui/
+├── app/                 # Next.js App Router pages & layouts
+├── widgets/             # Cross-feature compositions (e.g. AlertsTable + Filters)
+├── features/            # User-visible features (incidents, workflows, providers)
+├── entities/            # Domain models (alert, incident, workflow) + SWR hooks
+├── shared/              # Tokens, primitives, generic utilities
+├── components/          # Legacy / older UI (being migrated into shared/)
+├── utils/               # Pure functions
+├── auth.ts              # next-auth setup
+├── auth.config.ts
+├── middleware.ts        # Edge middleware (auth gate)
+├── proxyFetch.ts        # Server-side fetch with token forwarding
+├── instrumentation.ts   # Sentry / OTel browser setup
+└── jest.config.ts
+```
+
+Each FSD segment can have its own `ui/`, `api/`, `model/`, `lib/`, `config/` slices. The Next.js router lives only in `app/`.
+
+## Conventions (enforced by `.cursor/rules/`)
+
+- **Named exports only**. No default exports. Avoid `index.ts` and generic filenames — name files after their main export (`IncidentList.tsx`, `useIncidents.ts`).
+- **Functional components** only; no classes. Avoid `useEffect` when a ref callback works; avoid `useState` when props are sufficient.
+- **Data fetching via SWR**:
+  - Hook in `entities/<entity>/model/use<Entity>.ts`.
+  - SWR keys in `entities/<entity>/lib/<entity>Keys.ts` as an object with `all`, `list(query)`, `detail(id)`, `getListMatcher()`. Compose list keys by joining params with `"::"` and filtering falsy values.
+- **Mutations** in `use<Entity>Actions.ts`, with a sibling `use<Entity>Revalidation.ts`. Toast on success/error.
+- **Props types**: `PascalCase` ending in `Props` (`AlertRowProps`). Hook return types end in `Value`.
+- **Reuse** UI primitives — check `@/shared/ui/` before creating a new base component.
+- **Tailwind first**. Non-Tailwind CSS must be namespaced under the component class, BEM for modals, imported from a colocated `.css`.
+
+## Realtime updates
+
+The Frontend opens a long-lived `EventSource` against the Gateway's `/sse` endpoint. Events flow:
+
+| Event | Handler |
+| --- | --- |
+| `poll-alerts` | Optimistically appends/updates rows in the alerts feed. |
+| `incident-change` | Re-fetches the affected incident. |
+| `poll-presets` | Re-renders the saved-search counters. |
+| `topology-update` | Invalidates the topology view. |
+
+See `features/.../use*.ts` for the concrete subscription hooks.
+
+## Authentication
+
+`auth.ts` configures `next-auth` with Keycloak (and other providers). On the server, `proxyFetch.ts` (and the Node variant `proxyFetch.node.ts`) forwards the user's access token to the Gateway. Edge middleware (`middleware.ts`) enforces sign-in for protected routes.
+
+## Configuration
+
+The Frontend reads its environment from `.env.local` for development. The most important variables:
+
+| Variable | Description |
+| --- | --- |
+| `NEXT_PUBLIC_API_URL` | Public URL of the API Gateway. |
+| `API_URL` | Server-side URL of the Gateway (used by `proxyFetch`). |
+| `NEXTAUTH_URL` | Canonical URL of the Frontend. |
+| `NEXTAUTH_SECRET` | Cookie/token signing secret. |
+| `KEYCLOAK_*` | Keycloak issuer / client id / client secret. |
+| `SENTRY_*` | Sentry browser+server DSN. |
+
+## Build / run / test
+
+```bash
+# Dev
+npm install
+npm run dev                 # turbopack on :3000 — builds Monaco workers first
+
+# Production
+npm run build
+npm run start
+
+# Quality
+npm run lint
+npm run typecheck
+npm test                    # Jest — co-locate tests in __tests__/ next to the module
+```
+
+The Dockerfile (`docker/Dockerfile.ui`) builds with Next.js standalone output for a slim production image.
+
+## Migration status
+
+- `keep-ui/` will eventually move out of the legacy `keep` monorepo into its own repository alongside `keep-api-gateway`, `keep-event-handler`, and `keep-workflows`.
+- Older pages under `components/` are being migrated into `features/` + `entities/` per FSD. New work goes directly into the FSD layout.

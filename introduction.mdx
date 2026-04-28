@@ -1,0 +1,50 @@
+---
+title: "Introduction"
+description: "Welcome to the Keep developer guide"
+---
+
+Welcome to the **Keep** developer guide. This documentation is written for engineers who build, run, or extend Keep — an open-source alerting and on-call management platform.
+
+## What is Keep?
+
+Keep centralizes alerts from any observability tool (Prometheus, Datadog, Sentry, Grafana, CloudWatch, …), deduplicates them, correlates them into incidents, and runs YAML-defined workflows in response. It is the connective tissue between your monitoring stack and your humans.
+
+## Microservices, not a monolith
+
+Keep used to ship as a single Python container that handled everything: HTTP ingestion, parsing, deduplication, workflow execution, and serving the UI. That monolith has been split into focused services that scale, fail, and deploy independently:
+
+| Service | Repo | Responsibility |
+| --- | --- | --- |
+| **API Gateway** | `keep-api-gateway` | Authenticated HTTP front door. Validates requests, produces raw events to the broker, exposes CRUD APIs and SSE for the UI. |
+| **Event Handler** | `keep-event-handler` | Consumes raw events from Kafka/Redis. Parses them via provider classes, deduplicates, persists to Postgres, indexes in Elasticsearch, triggers workflows and rules. |
+| **Workflows** | `keep-workflows` | Long-running workflow engine. Parses YAML, schedules executions, runs steps and actions through pluggable providers. |
+| **Frontend** | `keep/keep-ui` (still in monorepo) | Next.js 15 + React 19 UI. Talks to the API Gateway, receives realtime updates over SSE. |
+
+The remaining `keep/` monorepo holds the frontend (`keep-ui/`) and a small set of legacy/shared assets. The original backend tree (`keep/keep/api/`, `keep/keep/event_handler/`) is preserved for reference during the migration window — **new code goes into the dedicated service repositories**.
+
+## High-level tech stack
+
+- **Backend services**: Python 3.11+, FastAPI, SQLModel/SQLAlchemy, Alembic.
+- **Messaging**: Apache Kafka (production), Redis + Arq (legacy / dev).
+- **Datastores**: PostgreSQL (system of record), Elasticsearch/OpenSearch (search), Redis (cache, ARQ queues).
+- **Frontend**: Next.js 15 (App Router), React 19, TypeScript, Tailwind, SWR, next-auth.
+- **Identity**: Keycloak (OIDC) by default; pluggable via `IdentityManagerFactory`.
+- **Deployment**: Docker / Docker Compose for dev; Kubernetes (Helm/Kustomize) for production.
+- **Observability**: OpenTelemetry, Prometheus, structured JSON logs.
+
+## How to read this guide
+
+<CardGroup cols={2}>
+  <Card title="Getting Started" icon="play" href="/getting-started">
+    Clone every repo, run the stack locally, send your first alert.
+  </Card>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture/overview">
+    The big picture — services, brokers, datastores, and how they connect.
+  </Card>
+  <Card title="Services" icon="cubes" href="/services/api-gateway">
+    Per-service deep dives with entry points, env vars, and run commands.
+  </Card>
+  <Card title="Components" icon="puzzle-piece" href="/components/alert-manager">
+    Alert manager, workflow engine, rules engine, providers.
+  </Card>
+</CardGroup>

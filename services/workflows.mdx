@@ -1,0 +1,227 @@
+---
+title: "Workflows"
+description: "keep-workflows — the YAML-driven automation engine."
+---
+
+The **Workflows** service (`keep-workflows`) parses YAML workflow definitions, schedules their execution, and runs steps and actions through pluggable providers. It is a long-running FastAPI app with a singleton scheduler running in-process.
+
+## Responsibilities
+
+- Parse YAML workflow files into `Workflow` / `Step` objects.
+- Match incoming events (alerts, incidents, manual triggers) against workflow trigger conditions (CEL).
+- Schedule workflow runs and dispatch them to a `ThreadPoolExecutor`.
+- Execute steps that **read** data (queries) and **act** on systems (notifications, tickets).
+- Persist execution logs and surface them via the HTTP API for the UI.
+
+## Layout
+
+```
+keep-workflows/
+├── pyproject.toml
+├── Dockerfile
+└── src/
+    ├── main.py                   # FastAPI factory + lifespan boots WorkflowManager
+    ├── api/                      # alternate entrypoint that wires Arq workers
+    │   ├── api.py                # full app with custom_worker integration
+    │   └── custom_worker.py
+    ├── workflowmanager/          # singleton orchestrator + scheduler
+    ├── parser/                   # YAML → Workflow
+    ├── step/                     # Step lifecycle
+    ├── conditions/, throttles/, actions/
+    ├── iohandler/                # {{ ... }} interpolation
+    ├── contextmanager/           # event/alert/incident/secrets context
+    ├── providers/                # Provider library (HTTP, Slack, Postgres, …)
+    ├── routes/
+    │   ├── workflows.py          # primary HTTP surface, mounted at /workflows
+    │   └── healthcheck.py
+    ├── identitymanager/          # auth verifier
+    ├── secretmanager/             # File / Vault / GCP / K8s / DB / AWS
+    ├── searchengine/, rulesengine/, exceptions/
+    └── common/
+        ├── core/db.py            # the single source of truth for query helpers
+        ├── core/cel_to_sql/      # CEL → SQL translation
+        ├── arq_pool.py           # Arq client (used by api/api.py)
+        ├── models/db/            # SQLModel schemas (workflow, provider, alert, incident)
+        └── utils/cel_utils.py
+```
+
+## Entry points
+
+The Workflows repository ships two entry points — pick deliberately.
+
+| Entry point | Use it for | Notes |
+| --- | --- | --- |
+| `src/main.py` (`app` / `get_app()`) | Standalone Workflows service | Thin FastAPI shell. Mounts the `/workflows` router and starts the manager in `lifespan`. This is what production runs. |
+| `src/api/api.py` | Embedded mode (full Keep backend) | Richer app with Arq worker integration, additional middlewares, and event-processing routes. Used when running Workflows inside the legacy monolith. |
+
+`src/main.py` is the **canonical** standalone entry point.
+
+## The `WorkflowManager` singleton
+
+`src/workflowmanager/workflowmanager.py` is a `threading.Lock`-guarded singleton. On FastAPI startup the lifespan calls:
+
+```python
+workflow_manager = WorkflowManager.get_instance()
+await workflow_manager.start()
+```
+
+`start()` boots `WorkflowScheduler`, which:
+
+1. Polls the DB via `WorkflowStore` for workflows whose schedule is due.
+2. Constructs `Workflow` objects via `Parser`.
+3. Dispatches them to a `ThreadPoolExecutor` whose size is controlled by `WORKFLOWS_MAX_WORKERS` (default `20`).
+4. Honors per-fingerprint execution strategy: `NONPARALLEL`, `NONPARALLEL_WITH_RETRY`, or `PARALLEL`.
+
+Because the manager is a singleton, **tests that boot it directly must reset `WorkflowManager._instance = None` before and after**. The provided fixtures (`tests/fixtures/workflow_manager.py`) do this automatically.
+
+## Scheduler internals
+
+`WorkflowScheduler` (`src/workflowmanager/workflowscheduler.py`) is what actually runs your workflows. The mechanism:
+
+- **Polling loop**. A background loop sleeps 1 second between iterations and calls `_handle_interval_workflows()` + `_handle_event_workflows()` every cycle. Every 100 iterations (~100s) it also runs `_timeout_workflows()` to mark stuck executions as ERROR.
+- **Pool**. `ThreadPoolExecutor(max_workers=KEEP_MAX_WORKFLOW_WORKERS, thread_name_prefix="WorkflowScheduler")`. Default 20. `executor.submit()` returns a `Future`; the scheduler tracks them in `self.futures` with a callback to remove on completion.
+- **Queue**. `self.workflows_to_run` is a plain Python `list` protected by `threading.Lock`. The producer (`WorkflowManager.insert_events`) appends; the consumer (`_handle_event_workflows`) atomically swaps the list out:
+  ```python
+  with self.lock:
+      workflows_to_run, self.workflows_to_run = self.workflows_to_run, []
+  ```
+  This is **in-memory only** — a pod restart loses queued events, and the queue does not distribute across pods. A Redis-backed queue is a TODO in the code.
+
+### Execution strategies
+
+A workflow declares `strategy:` at the top level. The scheduler enforces it via `_get_unique_execution_number()`, which builds an integer key and uses it as a unique constraint when inserting the `WorkflowExecution` row. Conflict on the constraint → strategy decides what happens.
+
+| Strategy | Key | Behaviour on collision |
+| --- | --- | --- |
+| `NONPARALLEL` | `SHA256(fingerprint:workflow_id) % MAX_SIGNED_INT` | `IntegrityError` → run is dropped, error logged. |
+| `NONPARALLEL_WITH_RETRY` (default) | same | Re-enqueue with refreshed enrichments; retry next iteration. |
+| `PARALLEL` | random UUID hash | No collision possible — multiple runs proceed concurrently. |
+
+Use `NONPARALLEL_WITH_RETRY` unless you have a specific reason. `NONPARALLEL` is for expensive runs you'd rather drop than retry; `PARALLEL` is for genuinely independent steps where ordering does not matter.
+
+### Timeouts
+
+`WORKFLOWS_TIMEOUT` (default 120 minutes) is the wall-clock cap. `_timeout_workflows()` finds executions older than that and writes their status to `ERROR`. The thread keeps running — the timeout flag is informational, not a kill signal. If you ship long-running workflows, raise this and consider backing them with `KEEP_MAX_WORKFLOW_WORKERS` headroom.
+
+### Ops switches
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `KEEP_MAX_WORKFLOW_WORKERS` | `20` | Executor pool size. |
+| `WORKFLOWS_INTERVAL_ENABLED` | `"true"` | Gate interval-scheduled workflows. Set false to keep manual-only triggers. |
+| `WORKFLOWS_TIMEOUT` | `120` (minutes) | Wall-clock cap. |
+| `KEEP_READ_ONLY` | `"false"` | Adds a 3-second sleep per workflow run. Used in demo / read-only environments. |
+| `WORKFLOW_MANAGER_DEBUG` | `"false"` | DEBUG logging for the manager. |
+
+## Triggers
+
+Workflows declare what they react to with an `on:` clause. The supported trigger types and how each is dispatched:
+
+| Trigger | How it fires |
+| --- | --- |
+| `alert` | `WorkflowManager.insert_events(tenant_id, [alerts])` evaluates each workflow's CEL filter against each alert. Match → enqueue. |
+| `incident` | `WorkflowManager.insert_incident(...)`. Same matching mechanism, against `IncidentDto`. |
+| `schedule` | Cron expression on the `Workflow` row. The scheduler's interval handler picks up workflows whose `next_run <= now`. |
+| `interval` | Fixed delay in minutes. Computed as `last_run + interval`. |
+| `manual` | `POST /workflows/{id}/run` on the HTTP surface. |
+
+### CEL evaluation, with backward compat
+
+`insert_events` evaluates the workflow's `on:` clause through `celpy`. Two helpers smooth over older syntax:
+
+- `_convert_filters_to_cel` translates the deprecated regex-filter form to CEL: `r"prometheus|grafana"` becomes `source.contains("prometheus") || source.contains("grafana")`. Anything you find still using the old form should be migrated, but it works.
+- `preprocess_cel_expression` normalizes severity comparisons. CEL has no enum type, so `severity > "warning"` would compare strings lexicographically (and silently produce wrong answers). The helper rewrites it against the numeric ordinal of `AlertSeverity`.
+
+Two extra modifiers commonly used on alert triggers:
+
+- `only_on_change` — fetch the previous alert with the same fingerprint via `get_previous_alert_by_fingerprint`. If nothing changed, skip the workflow.
+- `severity_changed` — same idea but specifically for severity transitions.
+
+Both modifiers turn the workflow into a state-change reactor rather than a heartbeat reactor — useful for "page on transition to critical" kinds of automations.
+
+## The execution pipeline
+
+For one workflow run:
+
+```mermaid
+flowchart LR
+    YAML[workflow.yaml] --> Parse[Parser]
+    Parse --> Wf[Workflow object]
+    Wf --> Ctx[ContextManager]
+    Ctx --> IO[IOHandler<br/>{{ ... }}]
+    IO --> Step[Step]
+    Step --> Provider[ProvidersFactory]
+    Provider -->|read| Result[Step result]
+    Result --> Next[Next step]
+    Step --> Save[save_workflow_results]
+```
+
+1. **`Parser`** (`src/parser/parser.py`) — YAML to `Workflow` with two ordered lists: data-fetching `Step`s and side-effecting action `Step`s.
+2. **`ContextManager`** (`src/contextmanager/contextmanager.py`) — holds event/alert/incident/consts/secret context.
+3. **`IOHandler`** (`src/iohandler/iohandler.py`) — renders `{{ ... }}` against the context, with built-in helper functions.
+4. **`Step`** — resolves a provider through `ProvidersFactory` and executes. Conditions and throttles gate action steps.
+5. Results and errors are persisted via `save_workflow_results`.
+
+## Premium providers
+
+`PREMIUM_PROVIDERS = ["bash", "python", "llamacpp", "ollama"]` are blocked in multi-tenant mode. When adding a new provider with arbitrary code execution potential, update this guard.
+
+## HTTP surface
+
+`src/routes/workflows.py` is the primary router (mounted at `/workflows`). Every endpoint takes an `AuthenticatedEntity` via `IdentityManagerFactory.get_auth_verifier([scopes])`. Common scopes:
+
+- `read:workflows`, `write:workflows`
+- `read:providers`, `write:providers`
+- `read:secrets`, `write:secrets`
+
+`/workflows/providers` and `/providers` (root) are convenience endpoints that return everything the frontend needs to render the providers picker.
+
+## Configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `KEEP_WORKFLOWS_HOST` | `0.0.0.0` | Bind address. |
+| `KEEP_WORKFLOWS_PORT` | `8082` | Bind port. |
+| `KEEP_VERSION` | `0.49.8` | Reflected in `/` and OpenAPI. |
+| `WORKFLOWS_MAX_WORKERS` | `20` | Size of the executor pool. |
+| `SECRET_MANAGER_TYPE` | `file` | `file`, `vault`, `gcp`, `aws`, `kubernetes`, `db`. |
+| `SECRET_MANAGER_DIRECTORY` | `./secrets` | When using the file backend. |
+| `AUTH_TYPE` | `noauth` | Identity backend; same options as the Gateway. |
+| `KEEP_API_URL` | unset | Where to reach the Gateway for callbacks (notifications, etc.). |
+
+The `SINGLE_TENANT_UUID = "keep"` constant in `src/common/core/db.py` is the dev/single-tenant default. Most service code accepts `tenant_id` as a parameter and falls back to this.
+
+## Run / test
+
+```bash
+poetry install --with dev
+
+# Dev server (auto-reload)
+poetry run uvicorn src.main:app --reload --port 8082
+
+# Production-like
+gunicorn src.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080
+
+# Full test suite (CI uses --timeout 60)
+poetry run pytest tests/
+
+# Single test
+poetry run pytest tests/test_workflow_execution.py::test_name -xvs
+
+# Coverage
+poetry run coverage run --omit="*/test*" --branch -m pytest --timeout 60 tests/
+poetry run coverage json --omit="src/providers/*"
+```
+
+## Tests — gotchas
+
+- `tests/conftest.py` builds a fresh SQLite file per `db_session` fixture and patches `src.common.core.db.engine`.
+- `mocked_context_manager` is autouse — opt out explicitly when you need the real one.
+- Both `test_app` and the manager fixture reset `WorkflowManager._instance = None`. Any test that boots the manager directly must do the same.
+- Canonical YAML examples for parser tests live in `examples/workflows/` (47 files, good reference for valid shapes).
+
+## Conventions specific to this repo
+
+- `src/main.py:get_app()` re-imports routers lazily to avoid circulars and to pick up monkeypatched modules during tests. **Preserve this pattern** when adding routers.
+- `src/common/core/db.py` is the **single source of truth** for query helpers. Don't add ad-hoc SQL in routes or the manager.
+- The version lives in `pyproject.toml` and is mirrored in `src/main.py` (`KEEP_VERSION` default) and the Docker image tag pipeline. Bump all three together.

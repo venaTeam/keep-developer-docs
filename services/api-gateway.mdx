@@ -1,0 +1,201 @@
+---
+title: "API Gateway"
+description: "keep-api-gateway — the HTTP front door for the platform."
+---
+
+The **API Gateway** (`keep-api-gateway`) is the only public entry point to Keep. It accepts alert webhooks, serves the REST/SSE surface used by the UI, and produces events to the broker for downstream processing.
+
+## Responsibilities
+
+- HTTP authentication and authorization (Keycloak / API keys / NoAuth).
+- Request validation and rate limiting (`slowapi`).
+- Producing raw alert events to Kafka or Redis (`EventProducer`).
+- CRUD APIs for alerts, incidents, presets, providers, rules, mappings, etc.
+- Server-Sent Events fan-out to connected browser clients (`/sse`).
+- The compatibility layer for legacy in-process consumers (the optional `EventSubscriber` for provider-driven webhooks like Pub/Sub).
+
+The Gateway deliberately does **not** parse alert payloads. That work belongs to the Event Handler.
+
+## Layout
+
+```
+keep-api-gateway/
+├── alembic.ini
+├── pyproject.toml
+└── src/
+    ├── main.py                 # FastAPI factory: get_app(), lifespan, run()
+    ├── middlewares.py          # LoggingMiddleware
+    ├── config/                 # consts + env-driven config (config.py)
+    ├── routes/                 # endpoint groups, mounted by routes/router_setup.py
+    ├── repositories/           # DB engine, dependencies, init_services
+    ├── services/
+    │   ├── producers/          # EventProducer interface + KafkaEventProducer + EventSubscriber
+    │   ├── identity_manager/   # IdentityManagerFactory, AuthVerifier
+    │   ├── secret_manager/     # File / Vault / GCP / K8s backends
+    │   └── alert_deduplicator/ # Pre-prod dedup helpers (most dedup runs in event-handler)
+    ├── providers/              # Provider classes (used for webhook routing/auth)
+    ├── functions/, parser/, exceptions/, utils/, models/
+```
+
+## Entry point
+
+```python
+# src/main.py (excerpt)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if KEEP_DEBUG_TASKS:
+        asyncio.create_task(check_pending_tasks(background_tasks))
+
+    await startup()                # dispose DB connections, start EventSubscriber if CONSUMER=true
+    yield {"background_tasks": background_tasks}
+    await shutdown()               # stop the EventSubscriber
+
+def get_app(auth_type=...) -> FastAPI:
+    app = FastAPI(title="Keep API", version=KEEP_VERSION, lifespan=lifespan)
+    app.add_middleware(GZipMiddleware, minimum_size=30 * 1024 * 1024)
+    app.add_middleware(CORSMiddleware, allow_origins=KEEP_CORS_TRUSTED_ORIGINS, ...)
+    setup_routers(app)
+    identity_manager = IdentityManagerFactory.get_identity_manager(SINGLE_TENANT_UUID, None, AUTH_TYPE)
+    identity_manager.on_start(app)  # wires sign-in routes for SINGLE_TENANT
+    return app
+```
+
+The runtime command in production is:
+
+```bash
+gunicorn src.main:get_app \
+  --bind 0.0.0.0:8080 \
+  --workers $KEEP_WORKERS \
+  -k uvicorn.workers.UvicornWorker \
+  -c src/config/config.py
+```
+
+`config.py` exposes `on_starting()` (init DB, provision dashboards) and `post_worker_init()` (re-initialise logging in each forked worker) which Gunicorn picks up via `-c`.
+
+## Routes
+
+Wired in `src/routes/router_setup.py`. High-traffic groups:
+
+| Prefix | File | Purpose |
+| --- | --- | --- |
+| `/alerts` | `routes/alerts.py` | Webhook ingestion (`POST /alerts/event/{provider}`), CRUD, `/query`. |
+| `/incidents` | `routes/incidents.py` | Incident CRUD, alert/incident relations. |
+| `/providers` | `routes/providers.py` | Install / configure / health-check provider integrations. |
+| `/preset`, `/facets`, `/cel` | `routes/preset.py`, `routes/facets.py`, `routes/cel.py` | Saved searches, sidebar facets, CEL helpers. |
+| `/rules` | `routes/rules.py` | Correlation rules. |
+| `/mapping`, `/extraction` | `routes/mapping.py`, `routes/extraction.py` | Enrichment configuration. |
+| `/maintenance` | `routes/maintenance.py` | Maintenance windows. |
+| `/sse` | `routes/sse_routes.py` | Server-Sent Events stream + internal `/sse/notify` from Event Handler. |
+| `/settings`, `/dashboard`, `/tags` | various | Tenant config. |
+| `/auth/*` | `routes/auth/` | Users, groups, roles, permissions. |
+| `/healthcheck`, `/metrics` | trivial | K8s probes and Prometheus scrape. |
+
+Every protected endpoint uses `IdentityManagerFactory.get_auth_verifier([scopes])` as a FastAPI dependency. Scopes are the canonical authorization unit (`read:alerts`, `write:rules`, …).
+
+## The webhook route
+
+The single most-trafficked route. Defined in `keep-api-gateway/src/routes/alerts.py` (around lines 545–584):
+
+```python
+@router.post("/event/{provider_type}", status_code=202)
+async def receive_event(
+    provider_type: str,
+    request: Request,
+    provider_id: str | None = None,
+    provider_name: str | None = None,
+    fingerprint: str | None = None,
+    event=Depends(extract_generic_body),
+    authenticated_entity: AuthenticatedEntity = Depends(
+        IdentityManagerFactory.get_auth_verifier(["write:alert"])
+    ),
+    event_producer: EventProducer = Depends(get_event_producer),
+) -> dict[str, str]:
+    ...
+```
+
+Anatomy of one request:
+
+1. **Auth** — `get_auth_verifier(["write:alert"])` validates a Bearer JWT, an `X-API-KEY`, or HTTP Basic and resolves `authenticated_entity.tenant_id`. See [Authentication](/operations/authentication) for the dispatch logic.
+2. **Body extraction** — `extract_generic_body` (`src/repositories/dependencies.py:14`) is content-type aware: `application/x-www-form-urlencoded` and `multipart/form-data` go through `await request.form()`; everything else attempts `await request.json()` and falls back to raw `await request.body()`.
+3. **Produce** — the `event_producer` builds the Kafka envelope (see [Architecture / Overview / The Kafka envelope](/architecture/overview)) and publishes to `KAFKA_TOPIC` (default `keep-events`).
+4. **Respond** — `202 Accepted`, body `{"task_name": "kafka-async-task"}` (or the DLQ variant if the producer fell back).
+
+### What this route deliberately does NOT do
+
+- **No payload size limit** — relies on Starlette defaults. A multi-MB hostile payload is accepted to the broker.
+- **No rate limit** — `slowapi` is wired at the app level via `KEEP_USE_LIMITER`, but the alerts ingestion route has no decorator. Document this in your deployment notes; if you front the Gateway with an LB, enforce there.
+- **No payload validation** — the route does not parse, schema-check, or sanity-test the body. Parsing is the Event Handler's job (failure isolation by design — see [Architecture / Overview / Why this split](/architecture/overview)).
+
+These gaps are intentional for ingestion latency, but the lack of a size cap is worth fixing. Tracked as a hardening item.
+
+## Producing events
+
+Webhook handlers (and the SSE notifier, and a few other internal callers) all reach for the same producer:
+
+```python
+producer = await get_event_producer()              # services/producers/factory.py
+await producer.produce(topic, payload)
+```
+
+`get_event_producer` is async and memoizes a single `KafkaEventProducer` per process. Adding a new broker means adding a class that satisfies `EventProducer` and registering it in the factory — no route changes needed.
+
+The current factory does **not** set a Kafka message key. That means partitioning is round-robin and per-tenant ordering is not guaranteed across consumer pods. See [Architecture / Messaging / Choosing a key](/architecture/messaging) for the tracked fix.
+
+## EventSubscriber
+
+For providers that pull events instead of pushing them (e.g. GCP Pub/Sub, in-process simulators), the Gateway optionally runs an in-process subscriber:
+
+```python
+# services/producers/event_subscriber.py — singleton
+event_subscriber = EventSubscriber.get_instance()
+await event_subscriber.start()  # spawns one thread per consumer-capable provider
+```
+
+This is enabled by `CONSUMER=true` (default) in the lifespan. When you install a consumer-capable provider through the API, the Gateway calls `event_subscriber.add_consumer(...)` to spin up a thread on demand.
+
+## Configuration
+
+Most options come from environment variables read by `src/config/config.py` via `starlette.config.Config`. Frequently used:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AUTH_TYPE` | `noauth` | Identity backend: `noauth`, `single_tenant`, `keycloak`, `auth0`. |
+| `PORT` | `8080` | Listen port. |
+| `KEEP_API_URL` | derived | Public URL the service is reachable at; used for callbacks and OAuth redirects. |
+| `KEEP_CORS_TRUSTED_ORIGINS` | `KEEP_PLATFORM_URL` | Comma-separated list of allowed origins. |
+| `KEEP_WORKERS` | `null` (Gunicorn default) | Number of Gunicorn workers. |
+| `KEEP_LIMIT_CONCURRENCY` | `null` | Per-worker concurrency cap. |
+| `KEEP_USE_LIMITER` | `false` | Enable `slowapi` rate limiting. |
+| `KEEP_METRICS` | `true` | Expose Prometheus `/metrics`. |
+| `KEEP_OTEL_ENABLED` | `true` | Configure OpenTelemetry exporter. |
+| `CONSUMER` | `true` | Run the in-process `EventSubscriber`. |
+| `MESSAGING_TYPE` | `KAFKA` | Pluggable broker selector (see [Messaging](/architecture/messaging)). |
+| `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, … | — | Kafka producer settings. |
+
+## Run / test
+
+```bash
+# install
+poetry install --with dev
+
+# run dev server
+poetry run uvicorn src.main:get_app --reload --port 8080
+
+# tests
+poetry run pytest tests/
+
+# lint
+poetry run ruff check src tests
+poetry run black src tests
+poetry run isort src tests
+
+# DB migrations
+poetry run alembic upgrade head
+poetry run alembic revision --autogenerate -m "..."
+```
+
+## What does NOT live here
+
+- **Alert parsing / deduplication / persistence** — see [Event Handler](/services/event-handler).
+- **Workflow execution** — see [Workflows](/services/workflows). The Gateway exposes some thin proxy routes for compatibility, but actual scheduling lives in `keep-workflows`.
+- **UI assets** — the Next.js frontend lives in `keep/keep-ui/`.

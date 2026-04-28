@@ -1,0 +1,80 @@
+---
+title: "Repository Layout"
+description: "What lives where, across the Keep namespace."
+---
+
+Keep is split across four sibling repositories. This page is a one-stop map — use it when you're not sure where a file should go.
+
+## Namespace tree
+
+```
+keep-namespace/
+├── keep/                       # legacy monorepo (frontend + shared infra)
+│   ├── keep-ui/                # Next.js 15 frontend (active)
+│   ├── keep/                   # legacy backend — DO NOT add new code here
+│   │   ├── api/                # legacy FastAPI app
+│   │   └── event_handler/      # in-tree predecessor of keep-event-handler
+│   ├── docker/                 # Dockerfiles used by docker-compose stacks
+│   ├── docker-compose*.yml     # canonical compose files for full-stack dev
+│   ├── developer_docs/         # ← you are here (this site)
+│   └── examples/               # YAML workflow examples
+│
+├── keep-api-gateway/           # HTTP front door
+│   └── src/
+│       ├── main.py             # FastAPI app factory (get_app)
+│       ├── config/             # env-driven configuration
+│       ├── routes/             # endpoint groups (alerts, incidents, ...)
+│       ├── services/
+│       │   ├── producers/      # EventProducer + Kafka/Redis impls
+│       │   ├── identity_manager/
+│       │   ├── secret_manager/
+│       │   └── alert_deduplicator/
+│       ├── repositories/       # DB/init/dependency wiring
+│       └── providers/          # Provider classes (used for ingestion auth, etc.)
+│
+├── keep-event-handler/         # Async consumer
+│   ├── main.py                 # FastAPI app — health + /metrics
+│   ├── consumer_main.py        # Standalone Kafka consumer loop
+│   ├── core/
+│   │   ├── kafka_consumer.py   # confluent-kafka loop
+│   │   ├── lifespan.py         # FastAPI lifespan (Redis path)
+│   │   └── bootstrap.py        # init_services + ARQ worker plumbing
+│   ├── controllers/            # event_controller.process_event_sync
+│   ├── alert_deduplicator/
+│   ├── rulesengine/
+│   ├── event_management/
+│   ├── event_subscriber/
+│   ├── providers/              # provider classes for parse_event_raw_body
+│   └── api/routes/v1/          # /v1/health, /v1/metrics
+│
+├── keep-workflows/             # Workflow engine
+│   └── src/
+│       ├── main.py             # FastAPI app + lifespan starts WorkflowManager
+│       ├── workflowmanager/    # singleton manager + scheduler
+│       ├── parser/             # YAML → Workflow / Step
+│       ├── step/               # Step execution
+│       ├── conditions/, throttles/, actions/
+│       ├── providers/          # full provider library (HTTP, Slack, …)
+│       ├── routes/workflows.py # primary HTTP surface
+│       ├── api/                # alternate entrypoint with Arq workers
+│       └── common/             # SQLModel schemas, DB helpers, CEL utilities
+│
+└── developer-docs/             # this repo, when split out
+```
+
+## File-naming conventions you'll see
+
+- **`main.py`** — every Python service has exactly one. The variable `app` (or `get_app()`) is the ASGI entry point.
+- **`pyproject.toml`** — every backend service uses Poetry; lockfiles (`poetry.lock`) are committed.
+- **`Dockerfile`** — single-stage at each service root. Production images run Gunicorn with Uvicorn workers, except the Event Handler's consumer which runs `python consumer_main.py` directly.
+- **`alembic.ini`** + `migrations/versions/` — services that own schema (Gateway, Workflows) have their own migration history. The Event Handler currently shares the Gateway's DB and does not run migrations on its own.
+
+## Where new code goes
+
+If you remember nothing else from this page:
+
+- New **HTTP route**? `keep-api-gateway/src/routes/`.
+- New **alert parser** or dedup logic? `keep-event-handler/`.
+- New **workflow step / action / provider integration**? `keep-workflows/src/providers/`.
+- New **UI feature**? `keep/keep-ui/features/<name>/` (Feature-Sliced Design — see [Frontend](/services/frontend)).
+- **Anything cross-cutting** (tokens, status codes, AlertDto schema): bump the schema in each service that consumes it. There is no shared package today.

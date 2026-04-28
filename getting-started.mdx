@@ -1,0 +1,133 @@
+---
+title: "Getting Started"
+description: "Clone the namespace, run the stack locally, send your first alert."
+---
+
+This page walks you through cloning every Keep service, running them with Docker Compose, and verifying the end-to-end alert pipeline.
+
+## Prerequisites
+
+- Docker + Docker Compose v2
+- Python `>=3.11,<3.14` (`pyenv` recommended)
+- [Poetry](https://python-poetry.org/) `>=1.3` for managing Python dependencies
+- Node.js 20+ and `npm` for the frontend
+- `git`
+
+## 1. Clone the namespace
+
+All Keep services live as sibling directories under a single namespace folder. Clone them next to each other:
+
+```bash
+mkdir keep-namespace && cd keep-namespace
+git clone https://github.com/keephq/keep.git
+git clone https://github.com/keephq/keep-api-gateway.git
+git clone https://github.com/keephq/keep-event-handler.git
+git clone https://github.com/keephq/keep-workflows.git
+```
+
+Your tree should look like:
+
+```
+keep-namespace/
+├── keep/                  # legacy monorepo (now hosts keep-ui/)
+├── keep-api-gateway/
+├── keep-event-handler/
+└── keep-workflows/
+```
+
+## 2. Bring up the infrastructure
+
+Each service ships an infra-only compose file (Postgres, Redis, Kafka, Elasticsearch, Keycloak). Pick one — they share the same network names — and start it:
+
+```bash
+cd keep-event-handler
+docker compose -f docker-compose.infra.yml up -d
+```
+
+This boots Postgres, Redis, and Kafka with sensible defaults. Other services connect to these by hostname.
+
+## 3. Run the API Gateway
+
+```bash
+cd ../keep-api-gateway
+poetry install
+poetry run uvicorn src.main:get_app --reload --port 8080
+```
+
+Defaults: `http://localhost:8080`. OpenAPI schema at `/docs`.
+
+## 4. Run the Event Handler
+
+The event handler has two entry points:
+
+- `main.py` — FastAPI app for health checks and metrics.
+- `consumer_main.py` — standalone Kafka consumer loop (this is where alerts are actually processed).
+
+```bash
+cd ../keep-event-handler
+poetry install
+# Health/metrics surface (port 8082 by default)
+poetry run python main.py &
+# Kafka consumer loop (blocks; metrics on 8083, health on 8082)
+poetry run python consumer_main.py
+```
+
+For Redis/ARQ mode, set `MESSAGING_TYPE=REDIS` and run `main.py` only — the lifespan starts the ARQ consumer for you.
+
+## 5. Run the Workflows service
+
+```bash
+cd ../keep-workflows
+poetry install
+poetry run uvicorn src.main:app --reload --port 8082
+```
+
+The `WorkflowManager` singleton boots in the FastAPI lifespan and starts polling the DB for due workflows.
+
+## 6. Run the frontend
+
+```bash
+cd ../keep/keep-ui
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). The UI expects the API Gateway at `http://localhost:8080` (override via `NEXT_PUBLIC_API_URL`).
+
+## 7. Send a test alert
+
+```bash
+curl -X POST http://localhost:8080/alerts/event/prometheus \
+  -H "Content-Type: application/json" \
+  -H "X-API-KEY: $KEEP_API_KEY" \
+  -d '{"alerts": [{"labels": {"alertname": "Hello", "severity": "critical"}, "status": "firing"}]}'
+```
+
+You should see:
+
+1. The Gateway return `202 Accepted` immediately.
+2. The Event Handler log a parsed alert and write it to Postgres.
+3. The alert appear in the UI feed (via SSE).
+
+If anything is off, check [`operations/observability`](/operations/observability) for the diagnostic surfaces every service exposes.
+
+## Useful commands
+
+```bash
+# Backend lint/format (each Python service)
+poetry run ruff check src tests
+poetry run black src tests
+poetry run isort src tests
+
+# Backend tests
+poetry run pytest tests/
+
+# DB migrations (per service that owns its schema)
+cd keep-api-gateway && poetry run alembic upgrade head
+
+# Frontend
+cd keep/keep-ui
+npm run lint
+npm run typecheck
+npm test
+```

@@ -1,0 +1,115 @@
+---
+title: "Providers"
+description: "How Keep talks to the outside world."
+---
+
+A **Provider** is a self-contained Python module that integrates Keep with one external system — Datadog, Slack, Postgres, S3, OpenAI, you name it. Providers serve two distinct roles depending on the service that loads them.
+
+## Two faces, one interface
+
+Each provider implements `BaseProvider` and registers with `ProvidersFactory`. Different services load the same provider for different reasons:
+
+| Service | Why it loads providers |
+| --- | --- |
+| `keep-api-gateway` | Webhook routing, provider install/configure flows, OAuth callbacks. |
+| `keep-event-handler` | Calling `parse_event_raw_body` and `format_alert` to turn raw payloads into `AlertDto`. |
+| `keep-workflows` | Calling `notify`, `query`, and `_query`/`_notify` from inside workflow steps. |
+
+The class hierarchy is shared, but each repository ships its own copy of the `providers/` directory today. There is no shared package — bumping a provider means updating it in every consuming service.
+
+## Anatomy of a provider
+
+```
+src/providers/<name>_provider/
+├── __init__.py
+├── <name>_provider.py      # the BaseProvider subclass
+├── <name>_alert.py         # provider-specific Pydantic models (optional)
+├── README.md
+└── tests/                  # provider-specific tests (optional)
+```
+
+The provider class typically implements:
+
+| Method | Required for | Purpose |
+| --- | --- | --- |
+| `validate_config` | All | Sanity-check user-supplied configuration. |
+| `parse_event_raw_body(body)` | Ingestion | Convert raw bytes into a Python dict the rest of the pipeline can work with. |
+| `format_alert(event, **kwargs)` | Ingestion | Map vendor schema to `AlertDto`. |
+| `_query(**kwargs)` / `_notify(**kwargs)` | Workflows | Read from / write to the external system. |
+| `setup_webhook` / `unset_webhook` | Push integrations | Configure the source to send events to Keep. |
+| `start_consume` / `stop_consume` | Pull integrations | Run a background subscription loop (e.g. Pub/Sub). |
+
+`ProvidersFactory.get_consumer_providers()` enumerates all classes that implement `start_consume`; the Gateway's `EventSubscriber` boots them in threads when `CONSUMER=true`.
+
+## Adding a new provider
+
+1. Decide which services need it. Most often that is **Workflows** (for actions) or both **Event Handler + Workflows** (when the system is also an alert source).
+2. Create `src/providers/<name>_provider/<name>_provider.py` in each consuming service.
+3. Subclass `BaseProvider`. Implement the relevant methods from the table above.
+4. Register the class via `ProvidersFactory` (the factory auto-discovers modules in `src/providers/`).
+5. Add tests under `tests/providers/` (or per-provider, per the local convention).
+6. Document required configuration in the docstring.
+
+## How dynamic loading works
+
+`ProvidersFactory.get_provider_class(provider_type)` resolves a `provider_type` string to a class via `importlib.import_module`:
+
+```python
+actual_provider_type = provider_type.split(".")[0]   # "cloudwatch.logs" → "cloudwatch"
+module = importlib.import_module(
+    f"src.providers.{actual_provider_type}_provider.{actual_provider_type}_provider"
+)
+provider_class = getattr(
+    module, actual_provider_type.title().replace("_", "") + "Provider"
+)
+```
+
+Two consequences:
+
+- **Class names are derived, not declared**. `pagerduty` → `PagerdutyProvider`, `cloudwatch_logs` → `CloudwatchLogsProvider`. Stick to the convention or the lookup fails.
+- **Sub-types split on `.`**. `cloudwatch.logs` and `cloudwatch.metrics` share a module — the second component is interpreted by the provider class.
+
+The event-handler and workflows factories diverge on import-path roots (`providers.…` vs `src.providers.…`). When porting a provider between repos, wrong import paths are the most common breakage.
+
+## Provider lifecycle
+
+`ProvidersService` (`keep-workflows/src/providers/providers_service.py`) owns the install/configure/health flow:
+
+1. **Install** — validate user-supplied config, persist an `InstalledProvider` row, write auth secrets to the configured `SecretManager`.
+2. **Configure** — update the secret value in place. Does not touch the `InstalledProvider` row.
+3. **Health check** — call `_query` (or a provider-specific `_health_check` if defined) with a probe payload. Failures surface in the UI's providers picker.
+
+### OAuth refresh
+
+For OAuth providers (Microsoft Teams, Salesforce, …), the access token is short-lived. The provider mutates `self.config.authentication` after a successful refresh, and the framework persists the change back to `SecretManager` synchronously in a `finally` block. This means the **next** workflow run picks up the refreshed token automatically — but it also means a buggy provider that mutates `config` for non-auth reasons can corrupt your secrets store. Mutate `config.authentication` explicitly, never as a side effect.
+
+## Multi-tenant safety
+
+`PREMIUM_PROVIDERS = ["bash", "python", "llamacpp", "ollama"]` are blocked in multi-tenant mode (Workflows service). The check lives in `WorkflowManager._check_premium_providers` and trips when `AUTH_TYPE in (AUTH0, MULTI_TENANT)`. When adding a provider that runs arbitrary code, executes shell, makes outbound calls to user-controlled URLs, or has unbounded resource consumption, add it to the list.
+
+### HTTP provider URL blacklist
+
+The HTTP provider explicitly blocks a set of host patterns to prevent SSRF against cloud metadata endpoints and internal services:
+
+- `metadata.google.internal`
+- `localhost` (and `127.0.0.0/8`)
+- `googleapis.com`
+- (others — see `BLACKLISTED_ENDPOINTS` in `http_provider.py`)
+
+A workflow that interpolates user-controlled data into a URL must still defend itself; the blacklist is a backstop, not a substitute for validation.
+
+## Drift across services
+
+`providers/` is duplicated across the gateway, event-handler, and workflows repos. There is no shared package today. Implications:
+
+- A provider bug fix is potentially three PRs.
+- `parse_event_raw_body` and `format_alert` semantics can drift between the gateway and event-handler copies.
+- The frontend has its own, hand-curated provider catalog (icons, display names) that needs to stay in sync.
+
+When this becomes more painful than the convenience it preserves, the path forward is a `keep-providers` package consumed by all four. Until then, when you change a provider, grep the namespace for every copy.
+
+## Where to look
+
+- **Factory**: `keep-workflows/src/providers/providers_factory.py` (most complete).
+- **Service layer** (install, configure, secrets): `keep-workflows/src/providers/providers_service.py`.
+- **Examples**: every directory under `keep-workflows/src/providers/` is a working reference. `keep_provider/`, `http_provider/`, `slack_provider/`, and `postgres_provider/` cover the most common patterns.

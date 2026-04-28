@@ -1,0 +1,147 @@
+---
+title: "Sequence Diagrams"
+description: "Cross-service flows, traced end-to-end."
+---
+
+These are the load-bearing flows in Keep. Each one crosses at least two services — the diagrams show *where* the boundaries are.
+
+## Story 1 — Alert ingestion
+
+```mermaid
+sequenceDiagram
+    participant P as Provider (Prometheus)
+    participant GW as keep-api-gateway
+    participant K as Kafka
+    participant EH as keep-event-handler
+    participant DB as Postgres
+    participant ES as Elasticsearch
+    participant WF as keep-workflows
+    participant UI as keep-ui (Browser)
+
+    P->>GW: POST /alerts/event/prometheus
+    GW->>GW: get_auth_verifier(["write:alert"])
+    GW->>GW: extract_generic_body
+    GW->>K: produce(topic="keep-events", envelope)
+    GW-->>P: 202 Accepted
+
+    EH->>K: poll()
+    K-->>EH: message
+    EH->>EH: parse_event_raw_body
+    EH->>EH: extraction (pre)
+    EH->>EH: format_alert → AlertDto
+    EH->>EH: extraction (post)
+    EH->>EH: maintenance check
+    EH->>EH: deduplicate
+    EH->>DB: upsert Alert
+    EH->>ES: index Alert
+    EH->>WF: HTTP trigger workflows
+    EH->>EH: rules engine
+    EH->>GW: POST /sse/notify (internal)
+    EH->>K: commit(offset)
+
+    GW-->>UI: SSE event "poll-alerts"
+    UI->>UI: optimistic UI update
+    UI->>GW: GET /alerts (background sync)
+```
+
+The latency budget breaks down roughly as:
+
+- Gateway auth + produce: < 10 ms.
+- Kafka end-to-end: 10–50 ms.
+- Event Handler pipeline: 50 ms (simple alert) to 500 ms+ (heavy extraction + ES indexing).
+- SSE notify → UI render: < 100 ms.
+
+If any one of those blows out, [Observability](/operations/observability) tells you where to look.
+
+## Story 2 — User login (Keycloak)
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant UI as keep-ui
+    participant KC as Keycloak
+    participant GW as keep-api-gateway
+
+    U->>UI: Click "Sign in"
+    UI->>KC: Redirect to /auth/realms/keep/protocol/openid-connect/auth
+    U->>KC: enter credentials
+    KC-->>UI: Redirect with auth code
+    UI->>KC: POST /token (exchange code)
+    KC-->>UI: id_token + access_token
+    UI->>UI: next-auth session.user.accessToken = access_token
+
+    U->>UI: Open dashboard
+    UI->>GW: GET /alerts (Authorization: Bearer)
+    GW->>GW: get_auth_verifier validates JWT against cached JWKS
+    GW->>GW: extract keep_tenant_id claim
+    GW->>UI: 200 OK (alerts data)
+    UI-->>U: Render alerts table
+```
+
+The first request to a new instance of the Gateway fetches Keycloak's JWKS over HTTP and caches it; subsequent requests verify locally.
+
+## Story 3 — Workflow execution
+
+```mermaid
+sequenceDiagram
+    participant EH as keep-event-handler
+    participant WF as keep-workflows API
+    participant Mgr as WorkflowManager
+    participant Sch as WorkflowScheduler
+    participant Exec as ThreadPoolExecutor
+    participant Step as Step.run
+    participant Provider as Provider._notify
+    participant Slack as Slack
+    participant DB as Postgres
+    participant GW as keep-api-gateway
+
+    EH->>WF: POST /workflows/_internal/insert_events
+    WF->>Mgr: insert_events(tenant_id, alerts)
+    Mgr->>Mgr: evaluate CEL on: clauses
+    Mgr->>Sch: workflows_to_run.append(...)
+
+    loop every 1s
+        Sch->>Sch: poll DB + drain queue
+        Sch->>Exec: submit(run_workflow)
+    end
+
+    Exec->>Step: run_steps()
+    Step->>Provider: _notify(payload)
+    Provider->>Slack: POST chat.postMessage
+    Slack-->>Provider: 200 OK
+    Provider-->>Step: result
+    Step->>DB: save_workflow_results
+
+    DB-->>Mgr: execution complete
+    Mgr->>GW: POST /sse/notify event="workflow-completed"
+```
+
+The strategy enum decides what happens on collision (same workflow + same fingerprint, already running). See [Workflows / Scheduler internals](/services/workflows#scheduler-internals).
+
+## Story 4 — SSE reconnection
+
+```mermaid
+sequenceDiagram
+    participant UI as Browser (useSSE)
+    participant GW as keep-api-gateway
+    participant Q as in-memory queue<br/>per (tenant, conn)
+
+    UI->>GW: POST /sse/subscribe (Authorization: Bearer)
+    GW->>Q: register asyncio.Queue
+    GW-->>UI: event: connected
+    loop streaming
+        Q-->>GW: queue.get() (or 30s keepalive)
+        GW-->>UI: event: poll-alerts | incident-change | ...
+    end
+
+    Note over UI,GW: TCP drop / pod rotation
+    UI->>UI: backoff(1s, 2s, 4s, ... up to 10 attempts)
+    UI->>GW: POST /sse/subscribe (Authorization: Bearer)
+    GW->>Q: register new queue
+    GW-->>UI: event: connected
+```
+
+Two known limitations of this flow:
+
+1. **Per-process state**: the queue map lives in the receiving Gateway pod. A reconnect that lands on a different pod creates a fresh queue — events that arrived during the disconnect window are lost. Sticky sessions (or moving the broker into Redis pub/sub) is the fix.
+2. **Token-in-URL fallback**: clients that can't set headers on `EventSource` send the token in a query parameter. Treat this as a security smell, not a feature.

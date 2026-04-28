@@ -1,0 +1,112 @@
+---
+title: "Observability"
+description: "Logs, metrics, traces — what to look at when something is wrong."
+---
+
+Every Keep service exposes the same three signals: structured JSON logs, Prometheus metrics, and OpenTelemetry traces. This page is the field guide.
+
+## Tracing
+
+OpenTelemetry is the default. Setup lives in:
+
+- `keep-api-gateway/src/utils/observability.py`
+- `keep-event-handler/observability.py`
+- `keep-workflows/src/utils/observability.py` (when present)
+
+All three services install the same instrumentations:
+
+| Instrumentor | What it captures |
+| --- | --- |
+| `FastAPIInstrumentor.instrument_app(app)` | HTTP request spans (route, method, status, duration). |
+| `RequestsInstrumentor()` | Outgoing HTTP calls (provider integrations, internal SSE notify). |
+| `LoggingInstrumentor()` | Inject `trace_id` / `span_id` into log records. |
+| `SQLAlchemyInstrumentor()` | DB query spans. |
+
+### Endpoint configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Default OTLP endpoint for all signals. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Override for traces. |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Override for metrics. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Override for logs. |
+| `KEEP_OTEL_ENABLED` | Master switch (default `true`). |
+| `METRIC_OTEL_ENABLED` | Toggle for OTel metrics specifically. |
+
+### Trace propagation across services
+
+- **HTTP**: automatic. The Gateway's outgoing call to `/sse/notify` and the Workflows service's HTTP triggers carry W3C `traceparent` headers; the receiver's instrumentation continues the trace.
+- **Kafka**: not automatic. Kafka header propagation is wired up by a custom middleware in `keep-event-handler/core/lifespan.py`. If you add a new producer or consumer, **propagate the trace headers manually** — OTel's auto-instrumentation does not cover the `confluent-kafka` client we use.
+
+## Metrics
+
+Each service exposes `/metrics` for Prometheus scraping. The Event Handler's standalone consumer additionally runs `prometheus_client.start_http_server(PROMETHEUS_METRICS_PORT)` (default `8083`) so metrics work even when the FastAPI app isn't running.
+
+### Gateway metrics
+
+Defined in `keep-api-gateway/src/repositories/metrics.py`:
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `keep_http_request_duration_seconds` | Histogram | `method`, `path`, `status_code` | Request latency. |
+| `keep_http_requests_total` | Counter | same | Request count. |
+| `provider_call_total` | Counter | `provider_type`, `tenant_id`, `result` | Outgoing calls into providers. |
+| `sse_active_connections` | Gauge | `tenant_id` | Currently subscribed SSE clients. |
+
+### Event Handler metrics
+
+Defined in `keep-event-handler/core/metrics.py`. The ones you'll watch in production:
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `events_in_counter` | Counter | `provider_type`, `tenant_id` | Messages dequeued from the broker. |
+| `events_out_counter` | Counter | `provider_type`, `tenant_id`, `result` | Messages successfully processed. |
+| `events_error_counter` | Counter | `provider_type`, `tenant_id`, `error_type` | Parsing / processing failures. |
+| `processing_time_summary` | Summary | `provider_type` | End-to-end latency per provider. |
+| `alert_enrichment_duration_seconds` | Histogram | `tenant_id` | Time spent in extraction/mapping rules. |
+| `deduplication_duration_seconds` | Histogram | `tenant_id` | Time spent in `AlertDeduplicator`. |
+| `rules_engine_duration_seconds` | Histogram | `tenant_id` | Time spent in `RulesEngine`. |
+| `alerts_maintenance_silenced_total` | Counter | `tenant_id`, `window_id`, `window_name` | Alerts dropped by a maintenance window. |
+| `alert_ingestion_total` | Counter | `source`, `status` | High-level ingestion volume. |
+| `deduplication_events_total` | Counter | `tenant_id`, `rule_id` | Dedup distribution stats (when enabled). |
+
+### Workflow metrics
+
+The Workflows service exposes execution counts, durations, and error counts via the standard FastAPI instrumentor. Custom counters live in `keep-workflows/src/common/core/metrics.py` (when present); the most useful are workflow-execution duration and per-strategy collision counts.
+
+## Logging
+
+All services use structured JSON. Setup is in `logging_conf.py` / `utils/logging.py`. The convention:
+
+- One JSON object per line.
+- Top-level fields: `timestamp`, `level`, `logger`, `message`.
+- Trace correlation: `trace_id`, `span_id` (injected by `LoggingInstrumentor`).
+- Request correlation: `tenant_id`, `request_id`, `status_code` — added by `LoggingMiddleware` on the Gateway.
+
+`LOG_LEVEL` env var per service (default `INFO`). For deep debugging, also set `WORKFLOW_MANAGER_DEBUG=true` (Workflows) — that turns on verbose state-transition logs.
+
+When grepping logs for one alert end-to-end, prefer `trace_id` over `tenant_id` — the latter is too noisy in multi-tenant deployments.
+
+## Health endpoints
+
+This is the part that's smaller than you'd expect:
+
+```python
+# routes/healthcheck.py — both services
+@router.get("", description="simple healthcheck endpoint")
+def healthcheck() -> dict:
+    return {}
+```
+
+**Health endpoints today are liveness-only.** A pod with a dead DB connection still returns 200. K8s readiness probes are configured to hit `/healthcheck` but cannot detect a DB or broker outage. Treat `/healthcheck` as "is the process alive" — for "is this pod ready to serve traffic", check upstream metrics or roll a readiness probe that pings the DB / broker yourself.
+
+A proper readiness probe is a tracked roadmap item.
+
+## Putting it together: debugging a slow alert
+
+1. Find the alert in the UI; copy its `trace_id` from the detail panel.
+2. Search the Gateway's logs for that `trace_id`. You should see the webhook hit (`POST /alerts/event/...`) with status 202 and the produce time.
+3. Search the Event Handler's logs for the same `trace_id`. Each pipeline stage (parse, dedup, save, ES, workflows, rules, SSE) should be a separate span.
+4. If the trace ends inside the Event Handler, check `events_error_counter` — a spike there points at a parser or extraction-rule failure.
+5. If the trace continues into the Workflows service, search there too; collision/retry behaviour shows up as duplicate spans with the same fingerprint.
+6. SSE delivery doesn't trace into the browser — to verify the UI received the event, check `sse_active_connections` on the Gateway and watch the dev-tools network tab.

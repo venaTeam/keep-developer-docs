@@ -1,0 +1,61 @@
+---
+title: "Contributing"
+description: "Conventions and workflow for contributing to Keep."
+---
+
+Keep is an open-source project distributed across several repositories. This page captures the conventions that apply across all of them.
+
+## Where does my change belong?
+
+| Change | Repository |
+| --- | --- |
+| New HTTP endpoint, auth/route logic | `keep-api-gateway` |
+| Alert parsing, dedup, persistence, search indexing | `keep-event-handler` |
+| Workflow engine, providers, scheduler | `keep-workflows` |
+| UI pages, components, hooks | `keep/keep-ui` |
+| Cross-service docs | this repo (`developer_docs`) |
+| Provider integrations (Slack, Datadog, …) | the service that uses them — usually `keep-workflows` for action providers, `keep-event-handler` for ingestion providers |
+
+If a feature spans services (e.g. a new field on `AlertDto`), open coordinated PRs against each service and link them in the descriptions.
+
+## Commit conventions
+
+All Python services use [semantic-release](https://python-semantic-release.readthedocs.io/) with the Angular commit parser. Allowed tags:
+
+```
+build, chore, ci, docs, feat, fix, perf, style, refactor, test
+```
+
+`feat` bumps the minor version; `fix` and `perf` bump the patch. Keep the subject line under 72 characters and write the body in the imperative mood.
+
+## Branching
+
+- Open PRs against `main`.
+- Use feature branches named `<author>/<short-slug>` (e.g. `yarin/dedup-cel-grouping`).
+- Squash-merge unless you have a specific reason to preserve history.
+
+## Linting & formatting
+
+Each Python service ships a `pyproject.toml` configured for `ruff`, `black`, and `isort`. The frontend uses `eslint` and `prettier`. CI enforces all of them — run them locally first.
+
+```bash
+# Python
+poetry run ruff check src tests
+poetry run black --check src tests
+poetry run isort --check-only src tests
+
+# Frontend
+npm run lint
+npm run typecheck
+```
+
+## Tests
+
+- **Backend**: `poetry run pytest tests/` — fixtures in `tests/conftest.py` spin up SQLite, Keycloak, and Elasticsearch as needed. The Workflows service's `WorkflowManager` is a singleton, so reset `WorkflowManager._instance = None` in any test that boots it directly.
+- **Frontend**: `npm test` — Jest + React Testing Library. Place tests in `__tests__/` next to the module.
+
+## Documentation
+
+This repository (the developer docs) is the canonical place for **architectural** and **cross-service** documentation. Per-service `README.md` and `CLAUDE.md` files are the canonical place for service-internal conventions. Keep both in sync when behaviour changes.
+
+When you add or rename a documentation page, update `mint.json` in the same PR — the navigation is not auto-generated.
